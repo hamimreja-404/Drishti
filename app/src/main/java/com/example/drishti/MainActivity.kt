@@ -1,12 +1,3 @@
-// ============================================================
-//  PROJECT DRISHTI — Full MainActivity.kt
-//  AI Vision Assistant for the Visually Impaired
-//  UDP + YOLOv11 + MobileFaceNet + ML Kit + Jetpack Compose
-// ============================================================
-//  Place in: app/src/main/java/com/example/drishti/MainActivity.kt
-//  Required assets: YOLOv11-Detection.tflite, mobilefacenet.tflite
-// ============================================================
-
 package com.example.drishti
 
 import android.Manifest
@@ -14,13 +5,11 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Rect
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.speech.RecognizerIntent
-import android.speech.tts.TextToSpeech
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -58,177 +47,20 @@ import com.google.mlkit.vision.face.FaceDetectorOptions
 import kotlinx.coroutines.*
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
-import java.util.*
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.sqrt
-
-// ============================================================
-//  DATA MODELS
-// ============================================================
-
-data class DetectionResult(
-    val label: String,
-    val confidence: Float,
-    val cx: Float,
-    val cy: Float,
-    val bw: Float,
-    val bh: Float,
-) {
-    val area: Float get() = bw * bh
-
-    val position: String get() = when {
-        cx < 0.33f -> "on your left"
-        cx > 0.67f -> "on your right"
-        else       -> "ahead"
-    }
-
-    val distanceLabel: String get() = when {
-        area > 0.25f -> "very close"
-        area > 0.10f -> "nearby"
-        area > 0.04f -> "ahead"
-        else         -> "far away"
-    }
-
-    val priorityScore: Float get() = confidence * (area * area)
-    val isRelevant: Boolean get() = area > 0.015f
-}
 
 enum class AppScreen { CONNECT, DASHBOARD, ADD_FACE, NAVIGATION }
 
 // ============================================================
-//  VOICE FEEDBACK MANAGER
+//  FACE RECOGNITION MANAGER
 // ============================================================
-
-class VoiceFeedbackManager(context: Context) : TextToSpeech.OnInitListener {
-
-    private val tts = TextToSpeech(context, this)
-    private val cooldownMap = mutableMapOf<String, Long>()
-    private var isReady = false
-
-    override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            tts.language = Locale.US
-            tts.setSpeechRate(1.05f)
-            tts.setPitch(0.95f)
-            isReady = true
-        }
-    }
-
-    fun speak(
-        text: String,
-        flush: Boolean = false,
-        cooldownKey: String? = null,
-        cooldownMs: Long = 0L
-    ) {
-        if (!isReady) return
-        if (cooldownKey != null) {
-            val now = System.currentTimeMillis()
-            if (now - (cooldownMap[cooldownKey] ?: 0L) < cooldownMs) return
-            cooldownMap[cooldownKey] = now
-        }
-        val mode = if (flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
-        tts.speak(text, mode, null, UUID.randomUUID().toString())
-    }
-
-    fun isSpeaking(): Boolean = tts.isSpeaking
-
-    fun shutdown() {
-        if (isReady) { tts.stop(); tts.shutdown() }
-    }
-}
-
-// ============================================================
-//  YOLO ANALYZER  (YOLOv11-Detection.tflite)
-// ============================================================
-
-class YOLOAnalyzer(context: Context, private val usePixelCoords: Boolean = false) {
-
-    private val interpreter: Interpreter
-    private val inputSize = 640
-    private val confThreshold = 0.45f
-    private val minAreaThreshold = 0.015f
-
-    private val highDangerLabels = setOf(
-        "person", "car", "motorcycle", "bus", "truck", "bicycle",
-        "dog", "stop sign", "traffic light"
-    )
-
-    private val labels = listOf(
-        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
-        "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
-        "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
-        "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
-        "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
-        "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
-        "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
-        "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
-        "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator",
-        "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
-    )
-
-    init {
-        val fd = context.assets.openFd("YOLOv11-Detection.tflite")
-        val buffer = FileInputStream(fd.fileDescriptor).channel
-            .map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
-        interpreter = Interpreter(buffer, Interpreter.Options().apply { numThreads = 4 })
-    }
-
-    fun analyze(bitmap: Bitmap): List<DetectionResult> {
-        val resized = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
-        val inputBuf = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4)
-            .apply { order(ByteOrder.nativeOrder()) }
-        val pixels = IntArray(inputSize * inputSize)
-        resized.getPixels(pixels, 0, inputSize, 0, 0, inputSize, inputSize)
-        for (px in pixels) {
-            inputBuf.putFloat(((px shr 16) and 0xFF) / 255f)
-            inputBuf.putFloat(((px shr 8)  and 0xFF) / 255f)
-            inputBuf.putFloat(( px         and 0xFF) / 255f)
-        }
-
-        val outBoxes   = Array(1) { Array(8400) { FloatArray(4) } }
-        val outScores  = Array(1) { FloatArray(8400) }
-        val outClasses = Array(1) { FloatArray(8400) }
-        interpreter.runForMultipleInputsOutputs(
-            arrayOf(inputBuf),
-            mapOf(0 to outBoxes, 1 to outScores, 2 to outClasses)
-        )
-
-        val raw = mutableListOf<DetectionResult>()
-        for (i in 0 until 8400) {
-            val score = outScores[0][i]
-            if (score < confThreshold) continue
-            val classId = outClasses[0][i].toInt().coerceIn(labels.indices)
-            val box = outBoxes[0][i]
-            val sc = if (usePixelCoords) inputSize.toFloat() else 1f
-            val cx = box[0] / sc
-            val cy = box[1] / sc
-            val bw = box[2] / sc
-            val bh = box[3] / sc
-            val area = bw * bh
-            val lbl = labels[classId]
-            if (area < minAreaThreshold && lbl !in highDangerLabels) continue
-            raw.add(DetectionResult(lbl, score, cx, cy, bw, bh))
-        }
-
-        return raw
-            .sortedByDescending { it.priorityScore }
-            .distinctBy { it.label }
-            .take(5)
-    }
-}
-
-// ============================================================
-//  FACE RECOGNITION MANAGER  (mobilefacenet.tflite + ML Kit)
-// ============================================================
-
 class FaceRecognitionManager(
     private val context: Context,
-    private val voiceManager: VoiceFeedbackManager,
+    private val voiceManager: VoiceManager,
     private val onStartListening: () -> Unit
 ) {
     private val interpreter: Interpreter
@@ -391,8 +223,7 @@ class FaceRecognitionManager(
 // ============================================================
 //  NAVIGATION MANAGER
 // ============================================================
-
-class NavigationManager(private val voiceManager: VoiceFeedbackManager) {
+class NavigationManager(private val voiceManager: VoiceManager) {
 
     var isNavigating = false
         private set
@@ -456,14 +287,13 @@ class NavigationManager(private val voiceManager: VoiceFeedbackManager) {
 // ============================================================
 //  MAIN ACTIVITY
 // ============================================================
-
 class MainActivity : ComponentActivity() {
 
-    private lateinit var voiceManager: VoiceFeedbackManager
+    private lateinit var voiceManager: VoiceManager
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        voiceManager = VoiceFeedbackManager(this)
+        voiceManager = VoiceManager(this)
         setContent {
             MaterialTheme {
                 Surface(color = Color(0xFF08080F), modifier = Modifier.fillMaxSize()) {
@@ -482,21 +312,22 @@ class MainActivity : ComponentActivity() {
 // ============================================================
 //  ROOT COMPOSABLE
 // ============================================================
-
 @Composable
-fun DrishtiApp(voiceManager: VoiceFeedbackManager) {
+fun DrishtiApp(voiceManager: VoiceManager) {
     val context = LocalContext.current
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    val coroutineScope = rememberCoroutineScope()
 
     var screen       by remember { mutableStateOf(AppScreen.CONNECT) }
     var isConnecting by remember { mutableStateOf(false) }
     var isConnected  by remember { mutableStateOf(false) }
-    var piIpText     by remember { mutableStateOf("Searching…") }
     var detections   by remember { mutableStateOf(listOf<DetectionResult>()) }
     var statusMsg    by remember { mutableStateOf("") }
 
-    val yolo    = remember { YOLOAnalyzer(context) }
-    val navMgr  = remember { NavigationManager(voiceManager) }
-    val faceRef = remember { mutableStateOf<FaceRecognitionManager?>(null) }
+    val objectDetector = remember { ObjectDetector(context) }
+    val cameraManager  = remember { CameraManager(context, lifecycleOwner) }
+    val navMgr         = remember { NavigationManager(voiceManager) }
+    val faceRef        = remember { mutableStateOf<FaceRecognitionManager?>(null) }
 
     val speechLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -525,93 +356,101 @@ fun DrishtiApp(voiceManager: VoiceFeedbackManager) {
         }.also { faceRef.value = it }
     }
 
+    // UPDATED: Now requests both CAMERA and RECORD_AUDIO
     val permLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { grants ->
-        val audioOk = grants[Manifest.permission.RECORD_AUDIO] == true
-        if (audioOk) {
-            when (screen) {
-                AppScreen.ADD_FACE   -> faceMgr.startEnrollmentFlow()
-                AppScreen.NAVIGATION -> speechLauncher.launch(
-                    Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                        putExtra(RecognizerIntent.EXTRA_PROMPT, "Where do you want to go?")
-                    }
-                )
-                else -> Unit
+        // Safely check if the specific permission was granted, defaulting to false if it wasn't even requested
+        val cameraOk = grants[Manifest.permission.CAMERA] ?: false
+        val audioOk = grants[Manifest.permission.RECORD_AUDIO] ?: false
+
+        when (screen) {
+            AppScreen.CONNECT -> {
+                if (cameraOk) {
+                    isConnecting = true
+                    voiceManager.speak("Activating camera.", true)
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        isConnected  = true
+                        isConnecting = false
+                        screen       = AppScreen.DASHBOARD
+                        voiceManager.speak("Connected. Vision system active.", true)
+                    }, 1400)
+                } else {
+                    voiceManager.speak("Camera permission is required to see.", true)
+                    isConnecting = false
+                }
             }
-        } else {
-            voiceManager.speak("Microphone permission is required for this feature.", true)
+            AppScreen.ADD_FACE -> {
+                if (audioOk) {
+                    faceMgr.startEnrollmentFlow()
+                } else {
+                    voiceManager.speak("Microphone permission is required to save names.", true)
+                    screen = AppScreen.DASHBOARD // Kick them back if denied
+                }
+            }
+            AppScreen.NAVIGATION -> {
+                if (audioOk) {
+                    speechLauncher.launch(
+                        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                            putExtra(RecognizerIntent.EXTRA_PROMPT, "Where do you want to go?")
+                        }
+                    )
+                } else {
+                    voiceManager.speak("Microphone permission is required to set a destination.", true)
+                    screen = AppScreen.DASHBOARD
+                }
+            }
+            else -> Unit
         }
     }
 
     val detCooldowns = remember { mutableMapOf<String, Long>() }
 
+    // UPDATED: Replaced UDP with CameraManager
     LaunchedEffect(isConnected) {
-        if (!isConnected) return@LaunchedEffect
-        withContext(Dispatchers.IO) {
-            var socket: DatagramSocket? = null
+        if (isConnected) {
             var lastAnalysisTime = 0L
-            try {
-                socket = DatagramSocket(5005).apply { soTimeout = 4000 }
-                val buf    = ByteArray(65535)
-                val packet = DatagramPacket(buf, buf.size)
+            cameraManager.startReceivingFrames { bitmap ->
+                val now = System.currentTimeMillis()
+                // Throttle frames to process roughly 1 per second to save battery
+                if (now - lastAnalysisTime < 1000) return@startReceivingFrames
+                lastAnalysisTime = now
 
-                while (isActive && isConnected) {
-                    try {
-                        socket.receive(packet)
-                        val senderIp = packet.address?.hostAddress ?: "unknown"
-                        withContext(Dispatchers.Main) { piIpText = "Pi · $senderIp" }
-
-                        val bitmap = BitmapFactory.decodeByteArray(packet.data, 0, packet.length)
-                            ?: continue
-
-                        val now = System.currentTimeMillis()
-                        if (now - lastAnalysisTime < 1200) continue
-                        lastAnalysisTime = now
-
-                        when (screen) {
-                            AppScreen.ADD_FACE -> {
-                                faceMgr.analyze(bitmap)
-                            }
-                            AppScreen.NAVIGATION -> {
-                                val dets = withContext(Dispatchers.Default) { yolo.analyze(bitmap) }
-                                withContext(Dispatchers.Main) { detections = dets }
-                                navMgr.processDetections(dets)
-                            }
-                            AppScreen.DASHBOARD -> {
-                                val dets = withContext(Dispatchers.Default) { yolo.analyze(bitmap) }
-                                faceMgr.analyze(bitmap)
-                                withContext(Dispatchers.Main) {
-                                    detections = dets
-                                    val t = System.currentTimeMillis()
-                                    for (det in dets) {
-                                        val last = detCooldowns[det.label] ?: 0L
-                                        if (t - last > 5000L) {
-                                            detCooldowns[det.label] = t
-                                            voiceManager.speak(
-                                                "${det.label}, ${det.distanceLabel}, ${det.position}",
-                                                flush = false
-                                            )
-                                        }
+                coroutineScope.launch {
+                    when (screen) {
+                        AppScreen.ADD_FACE -> {
+                            faceMgr.analyze(bitmap)
+                        }
+                        AppScreen.NAVIGATION -> {
+                            val dets = withContext(Dispatchers.Default) { objectDetector.analyze(bitmap) }
+                            withContext(Dispatchers.Main) { detections = dets }
+                            navMgr.processDetections(dets)
+                        }
+                        AppScreen.DASHBOARD -> {
+                            val dets = withContext(Dispatchers.Default) { objectDetector.analyze(bitmap) }
+                            faceMgr.analyze(bitmap)
+                            withContext(Dispatchers.Main) {
+                                detections = dets
+                                val t = System.currentTimeMillis()
+                                for (det in dets) {
+                                    val last = detCooldowns[det.label] ?: 0L
+                                    if (t - last > 5000L) {
+                                        detCooldowns[det.label] = t
+                                        voiceManager.speak(
+                                            "${det.label}, ${det.distanceLabel}, ${det.position}",
+                                            flush = false
+                                        )
                                     }
                                 }
                             }
-                            AppScreen.CONNECT -> Unit
                         }
-                    } catch (_: java.net.SocketTimeoutException) {
-                        withContext(Dispatchers.Main) { statusMsg = "Waiting for Pi stream…" }
+                        AppScreen.CONNECT -> Unit
                     }
                 }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    statusMsg = "Stream error: ${e.message}"
-                    isConnected = false
-                    screen = AppScreen.CONNECT
-                }
-            } finally {
-                socket?.close()
             }
+        } else {
+            cameraManager.stopReceiving()
         }
     }
 
@@ -619,36 +458,30 @@ fun DrishtiApp(voiceManager: VoiceFeedbackManager) {
         AppScreen.CONNECT -> ConnectScreen(
             isConnecting = isConnecting,
             onConnect = {
-                isConnecting = true
-                voiceManager.speak("Connecting to Drishti Brain.", true)
-                Handler(Looper.getMainLooper()).postDelayed({
-                    isConnected  = true
-                    isConnecting = false
-                    screen       = AppScreen.DASHBOARD
-                    voiceManager.speak("Connected. Vision system active.", true)
-                }, 1400)
+                // FIX: ONLY ask for Camera when starting the app!
+                permLauncher.launch(arrayOf(Manifest.permission.CAMERA))
             }
         )
         AppScreen.DASHBOARD -> DashboardScreen(
-            piIp         = piIpText,
             detections   = detections,
             statusMsg    = statusMsg,
             onAddFace    = {
                 screen = AppScreen.ADD_FACE
                 detections = emptyList()
+                // FIX: ONLY ask for Microphone when saving a face
                 permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
             },
             onNavigation = {
                 screen = AppScreen.NAVIGATION
                 detections = emptyList()
+                // FIX: ONLY ask for Microphone when starting navigation
                 permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
             },
             onDisconnect = {
                 isConnected = false
                 screen      = AppScreen.CONNECT
                 detections  = emptyList()
-                piIpText    = "Searching…"
-                voiceManager.speak("Disconnected from Pi.", true)
+                voiceManager.speak("Camera disconnected.", true)
             }
         )
         AppScreen.ADD_FACE -> AddFaceScreen(
@@ -667,6 +500,7 @@ fun DrishtiApp(voiceManager: VoiceFeedbackManager) {
                 screen = AppScreen.DASHBOARD
             },
             onSetDestination = {
+                // FIX: ONLY ask for Microphone when setting a new destination
                 permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
             }
         )
@@ -676,7 +510,6 @@ fun DrishtiApp(voiceManager: VoiceFeedbackManager) {
 // ============================================================
 //  SCREEN: CONNECT
 // ============================================================
-
 @Composable
 fun ConnectScreen(isConnecting: Boolean, onConnect: () -> Unit) {
 
@@ -756,7 +589,7 @@ fun ConnectScreen(isConnecting: Boolean, onConnect: () -> Unit) {
                         )
                         Spacer(Modifier.height(6.dp))
                         Text(
-                            "CONNECT",
+                            "START",
                             color         = Color.White,
                             fontSize      = 11.sp,
                             fontWeight    = FontWeight.ExtraBold,
@@ -769,7 +602,7 @@ fun ConnectScreen(isConnecting: Boolean, onConnect: () -> Unit) {
             Spacer(Modifier.height(50.dp))
 
             Text(
-                if (isConnecting) "LOCATING DRISHTI BRAIN…" else "TAP CIRCLE TO CONNECT",
+                if (isConnecting) "ACTIVATING CAMERA…" else "TAP TO START VISION SYSTEM",
                 color         = if (isConnecting) Color(0xFF64B5F6) else Color(0xFF546E7A),
                 fontSize      = 13.sp,
                 fontWeight    = FontWeight.SemiBold,
@@ -786,7 +619,7 @@ fun ConnectScreen(isConnecting: Boolean, onConnect: () -> Unit) {
             }
 
             Spacer(Modifier.height(80.dp))
-            Text("UDP · Port 5005", color = Color(0xFF263238), fontSize = 11.sp, letterSpacing = 1.sp)
+            Text("Using Local Device Camera", color = Color(0xFF263238), fontSize = 11.sp, letterSpacing = 1.sp)
         }
     }
 }
@@ -794,10 +627,8 @@ fun ConnectScreen(isConnecting: Boolean, onConnect: () -> Unit) {
 // ============================================================
 //  SCREEN: DASHBOARD
 // ============================================================
-
 @Composable
 fun DashboardScreen(
-    piIp        : String,
     detections  : List<DetectionResult>,
     statusMsg   : String,
     onAddFace   : () -> Unit,
@@ -827,7 +658,7 @@ fun DashboardScreen(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box(Modifier.size(7.dp).clip(CircleShape).background(Color(0xFF4CAF50)))
                     Spacer(Modifier.width(6.dp))
-                    Text(piIp, color = Color(0xFF81C784), fontSize = 12.sp)
+                    Text("Local Camera Active", color = Color(0xFF81C784), fontSize = 12.sp)
                 }
             }
             Box(
@@ -927,13 +758,12 @@ fun DashboardScreen(
         ) {
             Icon(Icons.Default.PowerSettingsNew, null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(8.dp))
-            Text("DISCONNECT FROM PI", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+            Text("STOP CAMERA", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
         }
     }
 }
 
 // ── Detection Row ─────────────────────────────────────────────
-
 @Composable
 fun DetectionRow(det: DetectionResult) {
     val arrowIcon = when {
@@ -971,7 +801,6 @@ fun DetectionRow(det: DetectionResult) {
 }
 
 // ── Action Card ───────────────────────────────────────────────
-
 @Composable
 fun ActionCard(
     title      : String,
@@ -1004,7 +833,6 @@ fun ActionCard(
 // ============================================================
 //  SCREEN: ADD FACE
 // ============================================================
-
 @Composable
 fun AddFaceScreen(onBack: () -> Unit) {
 
@@ -1117,7 +945,6 @@ fun AddFaceScreen(onBack: () -> Unit) {
 // ============================================================
 //  SCREEN: NAVIGATION
 // ============================================================
-
 @Composable
 fun NavigationScreen(
     destination     : String,
