@@ -1,6 +1,8 @@
 package com.example.drishti
 
 import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioManager
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
@@ -10,6 +12,7 @@ import java.util.UUID
 class VoiceSystem(context: Context) : TextToSpeech.OnInitListener {
 
     private val tts = TextToSpeech(context, this)
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val cooldownMap = mutableMapOf<String, Long>()
     private var isReady = false
 
@@ -40,6 +43,12 @@ class VoiceSystem(context: Context) : TextToSpeech.OnInitListener {
                     localeScore * 10 + qualityScore
                 }
             if (clearVoice != null) tts.voice = clearVoice
+            tts.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
             tts.setSpeechRate(1.03f)
             tts.setPitch(1.05f)
             tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
@@ -76,6 +85,9 @@ class VoiceSystem(context: Context) : TextToSpeech.OnInitListener {
         if (!isReady || cleanText.isBlank()) return
 
         val now = System.currentTimeMillis()
+        audioManager.mode = AudioManager.MODE_NORMAL
+        @Suppress("DEPRECATION")
+        audioManager.isSpeakerphoneOn = true
 
         // Reject duplicates within 3 seconds for the same text
         if (cleanText == lastSpokenText && (now - lastSpokenTime < 3000)) {
@@ -111,6 +123,8 @@ class VoiceSystem(context: Context) : TextToSpeech.OnInitListener {
         val utteranceId = "${priority}_${UUID.randomUUID()}"
         val params = Bundle().apply {
             putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+            @Suppress("DEPRECATION")
+            putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
             putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, utteranceId)
         }
         tts.speak(cleanText, mode, params, utteranceId)

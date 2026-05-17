@@ -2,10 +2,15 @@ package com.example.drishti
 
 import android.Manifest
 import android.app.Activity
+import android.app.PictureInPictureParams
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Rect
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -58,7 +63,9 @@ import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
+import android.util.Rational
 import kotlinx.coroutines.channels.Channel
+import kotlin.math.abs
 
 enum class AppScreen { CONNECT, DASHBOARD, ADD_FACE, NAVIGATION }
 enum class CameraMode { NONE, LOCAL, EXTERNAL } // <-- ADD THIS
@@ -250,27 +257,79 @@ class FaceRecognitionManager(
 // ============================================================
 //  NAVIGATION MANAGER
 // ============================================================
-class NavigationManager(private val voiceSystem: VoiceSystem) {
+class NavigationManager(
+    private val context: Context,
+    private val voiceSystem: VoiceSystem,
+    private val onOpenWalkingMaps: (String) -> Unit
+) : LocationListener {
 
     var isNavigating = false
         private set
     var destination = ""
         private set
+    var routeStatus = ""
+        private set
 
     private var lastNavTime = 0L
     private val navCooldownMs = 1800L
+    private val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var targetLocation: Location? = null
+    private var lastRouteFeedbackTime = 0L
+    private var lastRouteDistanceMeters = Float.MAX_VALUE
+    private val routeFeedbackCooldownMs = 9000L
+    private val arrivalRadiusMeters = 18f
 
     fun start(dest: String) {
-        destination = dest.trim().replaceFirstChar { it.uppercaseChar() }
+        val cleanDest = dest.trim()
+        if (cleanDest.isBlank()) {
+            voiceSystem.speak("Destination not understood.", priority = 1)
+            return
+        }
+        if (!hasLocationPermission()) {
+            voiceSystem.speak("Location permission is required for real navigation.", priority = 1)
+            return
+        }
+        if (!MapSystem.isLocationEnabled(context)) {
+            voiceSystem.speak("Please turn on phone location for real navigation.", priority = 1)
+            return
+        }
+
+        destination = cleanDest.replaceFirstChar { it.uppercaseChar() }
         isNavigating = true
+        routeStatus = "Finding route"
+        targetLocation = null
+        stopLocationUpdates()
         voiceSystem.speak(
-            "Navigation started. Heading to $destination. I will alert you to obstacles.",
+            "Finding route to $destination.",
             priority = 1
         )
+        scope.launch {
+            val resolved = withContext(Dispatchers.IO) {
+                MapSystem.resolveDestination(context, cleanDest)
+            }
+            if (resolved == null) {
+                isNavigating = false
+                routeStatus = ""
+                voiceSystem.speak("I could not find that destination. Try a clearer place name or coordinates.", priority = 1)
+                return@launch
+            }
+            targetLocation = resolved
+            startLocationUpdates()
+            routeStatus = "GPS active"
+            voiceSystem.speak(
+                "Navigation started in walking mode. Opening Maps now.",
+                priority = 1
+            )
+            onOpenWalkingMaps(cleanDest)
+        }
     }
 
     fun stop() {
         isNavigating = false
+        routeStatus = ""
+        targetLocation = null
+        stopLocationUpdates()
         voiceSystem.speak("Navigation stopped.", priority = 1)
     }
 
@@ -308,6 +367,86 @@ class NavigationManager(private val voiceSystem: VoiceSystem) {
 
         voiceSystem.speak(instruction, priority = 2, cooldownKey = "nav_$instruction", cooldownMs = 2500)
     }
+
+    override fun onLocationChanged(location: Location) {
+        if (!isNavigating) return
+        val target = targetLocation ?: return
+        val distanceMeters = location.distanceTo(target)
+        val bearingToTarget = normalizeBearing(location.bearingTo(target))
+        routeStatus = "${distanceMeters.toInt()} m to $destination"
+
+        if (distanceMeters <= arrivalRadiusMeters) {
+            isNavigating = false
+            routeStatus = "Arrived"
+            stopLocationUpdates()
+            voiceSystem.speak("You have reached $destination.", priority = 1)
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        val distanceChangedEnough = abs(distanceMeters - lastRouteDistanceMeters) > 25f
+        if (now - lastRouteFeedbackTime < routeFeedbackCooldownMs && !distanceChangedEnough) return
+
+        lastRouteFeedbackTime = now
+        lastRouteDistanceMeters = distanceMeters
+        voiceSystem.speak(buildGpsInstruction(location, distanceMeters, bearingToTarget), priority = 2)
+    }
+
+    private fun buildGpsInstruction(location: Location, distanceMeters: Float, bearingToTarget: Float): String {
+        val distanceText = if (distanceMeters >= 1000f) {
+            "%.1f kilometers".format(distanceMeters / 1000f)
+        } else {
+            "${distanceMeters.toInt()} meters"
+        }
+        if (!location.hasBearing() || location.speed < 0.6f) {
+            return "$distanceText to $destination. Move a little forward for turn direction."
+        }
+
+        val relativeBearing = normalizeRelativeBearing(bearingToTarget - location.bearing)
+        val direction = when {
+            abs(relativeBearing) <= 20f -> "Continue straight"
+            relativeBearing in 20f..70f -> "Slight right"
+            relativeBearing > 70f -> "Turn right"
+            relativeBearing in -70f..-20f -> "Slight left"
+            else -> "Turn left"
+        }
+        return "$direction. $distanceText remaining."
+    }
+
+    private fun hasLocationPermission(): Boolean {
+        val fine = androidx.core.content.ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        val coarse = androidx.core.content.ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        return fine || coarse
+    }
+
+    @Suppress("MissingPermission")
+    private fun startLocationUpdates() {
+        if (!hasLocationPermission()) return
+        val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+            .filter { locationManager.isProviderEnabled(it) }
+        providers.forEach { provider ->
+            locationManager.requestLocationUpdates(provider, 2500L, 2f, this, Looper.getMainLooper())
+            locationManager.getLastKnownLocation(provider)?.let { onLocationChanged(it) }
+        }
+    }
+
+    private fun stopLocationUpdates() {
+        runCatching { locationManager.removeUpdates(this) }
+    }
+
+    private fun normalizeBearing(value: Float): Float = ((value % 360f) + 360f) % 360f
+
+    private fun normalizeRelativeBearing(value: Float): Float {
+        var normalized = normalizeBearing(value)
+        if (normalized > 180f) normalized -= 360f
+        return normalized
+    }
 }
 // ============================================================
 //  MAIN ACTIVITY
@@ -331,6 +470,22 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         if (::voiceSystem.isInitialized) voiceSystem.shutdown()
         super.onDestroy()
+    }
+}
+
+private fun openWalkingMapsWithDrishtiPip(context: Context, destination: String) {
+    val activity = context as? Activity
+    val openMaps = { MapSystem.startGoogleMapsNavigation(context, destination) }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && activity != null) {
+        runCatching {
+            val params = PictureInPictureParams.Builder()
+                .setAspectRatio(Rational(9, 16))
+                .build()
+            activity.enterPictureInPictureMode(params)
+        }
+        Handler(Looper.getMainLooper()).postDelayed({ openMaps() }, 350)
+    } else {
+        openMaps()
     }
 }
 
@@ -360,7 +515,11 @@ fun DrishtiApp(voiceSystem: VoiceSystem) {
     
     val cameraManager  = remember { CameraManager(context, lifecycleOwner) }
     val connectivityManager = remember { ConnectivityManager() }
-    val navMgr         = remember { NavigationManager(voiceSystem) }
+    val navMgr         = remember {
+        NavigationManager(context, voiceSystem) { destination ->
+            openWalkingMapsWithDrishtiPip(context, destination)
+        }
+    }
     val faceRef        = remember { mutableStateOf<FaceRecognitionManager?>(null) }
     
     var hardwareDistState by remember { mutableStateOf(0) }
@@ -503,13 +662,26 @@ fun DrishtiApp(voiceSystem: VoiceSystem) {
                 }
             }
             AppScreen.NAVIGATION -> {
-                if (audioOk) {
+                val locationOk = (grants[Manifest.permission.ACCESS_FINE_LOCATION] ?: false) ||
+                        (grants[Manifest.permission.ACCESS_COARSE_LOCATION] ?: false) ||
+                        androidx.core.content.ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.ACCESS_FINE_LOCATION
+                        ) == PackageManager.PERMISSION_GRANTED ||
+                        androidx.core.content.ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.ACCESS_COARSE_LOCATION
+                        ) == PackageManager.PERMISSION_GRANTED
+                if (audioOk && locationOk) {
                     speechLauncher.launch(
                         Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                             putExtra(RecognizerIntent.EXTRA_PROMPT, "Where do you want to go?")
                         }
                     )
+                } else if (!locationOk) {
+                    voiceSystem.speak("Location permission is required for real navigation.", priority = 1)
+                    screen = AppScreen.DASHBOARD
                 } else {
                     voiceSystem.speak("Microphone permission is required to set a destination.", priority = 1)
                     screen = AppScreen.DASHBOARD
@@ -634,22 +806,6 @@ fun DrishtiApp(voiceSystem: VoiceSystem) {
                                         }
                                     }
 
-                                    // Gemini fallback only when YOLO has been quiet for a while.
-                                    if (rawDetections.isEmpty() && now - lastFallbackTime > 18000) {
-                                        lastFallbackTime = now
-                                        launch(Dispatchers.Default) {
-                                            val description = llmAssistant.askQuestionAboutScene(
-                                                "Briefly describe nearby indoor objects or say path clear.",
-                                                bitmap
-                                            )
-                                            withContext(Dispatchers.Main) {
-                                                if (!isAssistantActive) {
-                                                    voiceSystem.speak(description, priority = 3, cooldownKey = "gemini_fallback", cooldownMs = 18000)
-                                                }
-                                            }
-                                        }
-                                    }
-
                                     withContext(Dispatchers.Main) {
                                         detections = rawDetections
                                     }
@@ -716,7 +872,13 @@ fun DrishtiApp(voiceSystem: VoiceSystem) {
             onNavigation = {
                 screen = AppScreen.NAVIGATION
                 detections = emptyList()
-                permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+                permLauncher.launch(
+                    arrayOf(
+                        Manifest.permission.RECORD_AUDIO,
+                        Manifest.permission.ACCESS_FINE_LOCATION,
+                        Manifest.permission.ACCESS_COARSE_LOCATION
+                    )
+                )
             },
             onAskAi = {
                 permLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
