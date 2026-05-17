@@ -23,8 +23,9 @@ class CameraManager(
 ) {
     private var cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private var imageAnalyzer: ImageAnalysis? = null
+    private var lastAnalysisTime = 0L
 
-    fun startReceivingFrames(onFrameReceived: (Bitmap) -> Unit) {
+    fun startReceivingFrames(onFrameReceived: (Bitmap, Int?) -> Unit) {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
 
         cameraProviderFuture.addListener({
@@ -36,11 +37,14 @@ class CameraManager(
                 .build()
                 .also { analysis ->
                     analysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                        val bitmap = imageProxy.toBitmap()
-                        val rotatedBitmap = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
-
-                        // Pass the frame to your main pipeline
-                        onFrameReceived(rotatedBitmap)
+                        val currentTime = System.currentTimeMillis()
+                        if (currentTime - lastAnalysisTime >= 1500) {
+                            lastAnalysisTime = currentTime
+                            val bitmap = imageProxy.toBitmap()
+                            val rotatedBitmap = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
+                            // LOCAL camera has no hardware sensor, so distance is always null
+                            onFrameReceived(rotatedBitmap, null)
+                        }
 
                         // Critical: close the proxy to receive the next frame
                         imageProxy.close()

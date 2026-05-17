@@ -14,34 +14,47 @@ class ConnectivityManager {
     private var udpSocket: DatagramSocket? = null
     private var isReceiving = false
 
-    // Standard port for ESP32/UDP streaming, change if your hardware uses a different one
     private val PORT = 6868
-    private val MAX_PACKET_SIZE = 65507 // Max UDP packet size
+    private val MAX_PACKET_SIZE = 65507
 
-    suspend fun startReceivingFrames(onFrameReceived: (Bitmap) -> Unit) {
+    // UPDATED: Callback now expects a Bitmap AND an Int? (nullable integer) for distance
+    suspend fun startReceivingFrames(onFrameReceived: (Bitmap, Int?) -> Unit) {
         withContext(Dispatchers.IO) {
             try {
                 udpSocket = DatagramSocket(PORT)
-                udpSocket?.soTimeout = 2000 // 2 seconds timeout
+                udpSocket?.soTimeout = 2000
                 isReceiving = true
 
                 val buffer = ByteArray(MAX_PACKET_SIZE)
                 val packet = DatagramPacket(buffer, buffer.size)
 
-                Log.d("ConnectivityManager", "Started listening for UDP frames on port $PORT")
+                Log.d("ConnectivityManager", "Listening for UDP frames on port $PORT")
 
                 while (isReceiving) {
                     try {
                         udpSocket?.receive(packet)
-                        // Decode the received JPEG byte array into a Bitmap
-                        val bitmap = BitmapFactory.decodeByteArray(packet.data, 0, packet.length)
+
+                        // 1. EXTRACT THE DISTANCE (The very first byte)
+                        // Use bitwise AND 0xFF to ensure it reads as a positive unsigned integer (0-255)
+                        val distanceCm = packet.data[0].toInt() and 0xFF
+                        Log.d("DRISHTI_NETWORK", "SUCCESS! Packet received. Size: ${packet.length} bytes")
+                        // 2. EXTRACT THE IMAGE (Skip the first byte)
+                        val bitmap = BitmapFactory.decodeByteArray(
+                            packet.data,
+                            1,                    // Start at index 1
+                            packet.length - 1     // Total length minus the 1 byte we removed
+                        )
+
                         if (bitmap != null) {
                             withContext(Dispatchers.Main) {
-                                onFrameReceived(bitmap)
+                                // Send BOTH pieces of data back to the UI
+                                onFrameReceived(bitmap, distanceCm)
                             }
+                        }else {
+                            // 🚨 ADD THIS LINE: It proves the packet arrived, but wasn't a valid JPEG image
+                            Log.e("DRISHTI_NETWORK", "ERROR: Packet received, but failed to decode into an image!")
                         }
                     } catch (e: SocketTimeoutException) {
-                        // Timeout is fine, just loop again if still receiving
                         continue
                     } catch (e: Exception) {
                         Log.e("ConnectivityManager", "Error receiving frame: ${e.message}")
